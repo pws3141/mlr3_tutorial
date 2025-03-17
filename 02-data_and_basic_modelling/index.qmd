@@ -1,0 +1,1222 @@
+---
+title: "Applied Machine Learning Using mlr3"
+subtitle: "Data and Basic Modelling"
+author: "Paul Smith"
+date: today
+format:
+  html:
+    embed-resources: true
+    code-annotations: hover
+    grid:
+      margin-width: 350px
+    fig-width: 6
+    fig-asp: 0.618
+    toc: true
+    toc-location: left
+bibliography: ref.bib
+reference-location: margin
+citation-location: margin
+fig-cap-location: margin
+tbl-cap-location: margin
+link-citations: true
+---
+
+## Introduction and prerequisites
+
+The `{mlr3}` package uses the R6 class system alongside `data.table` to store and operate on tabular data.
+
+For a brief introduction to the R6 class system, see [Section 1.5.1](https://mlr3book.mlr-org.com/chapters/chapter1/introduction_and_overview.html#sec-r6) of the mlr3 book, or the package [vignette](https://r6.r-lib.org/articles/Introduction.html). 
+
+For information on the `data.table` format, see the package [vignette](https://cran.r-project.org/web/packages/data.table/vignettes/datatable-intro.html). Some brief examples are given below.
+
+```{r}
+library(mlr3)
+library(mlr3viz)
+library(ggplot2)
+library(patchwork)
+library(data.table)
+options(datatable.print.nrows = 20)
+library(palmerpenguins)
+```
+
+
+### Some `data.table` examples
+
+```{r}
+input <- if (file.exists("flights14.csv")) {
+   "flights14.csv"
+} else {
+  "https://raw.githubusercontent.com/Rdatatable/data.table/master/vignettes/flights14.csv"
+}
+flights <- fread(input)
+
+# by default, DT shows first and last 5 rows
+flights
+```
+
+The general form of a data.table is given by:
+```
+DT[i, j, by]
+
+##   R:                 i                 j        by
+## SQL:  where | order by   select | update  group by
+```
+
+**Selecting rows**
+```{r}
+ans <- flights[origin == "JFK" & month == 6L]
+ans
+```
+
+**Selecting columns**
+```{r}
+# to output a vector
+res <- flights[, arr_delay]
+head(res)
+
+# to output a DT
+flights[, .(arr_delay)] # .() is equivalent to list()
+
+# output multiple columns and rename
+flights[, .(delay_arrival = arr_delay, destination = dest)]
+
+# selecting using names in j, similar to data.frame
+flights[, c("arr_delay", "dest")]
+
+# or, if stored in a character vector, use `..`
+# similar to "up-one-level" Unix terminal command
+which_cols <- c("arr_delay", "dest")
+flights[, ..which_cols]
+```
+
+**Computing in j**
+```{r}
+# how many trips had total delay of < 0?
+flights[, sum((arr_delay + dep_delay) < 0)]
+
+# average arrival and departure delay for all flights in June with origin "JFK"
+flights[month == 6 & origin == "JFK",
+       .(m_arr = mean(arr_delay), m_dep = mean(dep_delay))]
+```
+
+#### Aggregations
+
+** Grouping using `by`**
+```{r}
+# Number of trips corresponding to each origin airport
+flights[, .(.N), by = .(origin)]
+
+# can drop .() if only one expression in j
+flights[carrier == "AA", .N, by = origin]
+
+# total number of trips for each origin, dest pair for carrier code "AA"
+flights[carrier == "AA", .N, by = .(origin, dest)]
+
+# average arrival and departure delay for each origin, dest pair for each month for carrier code "AA"
+flights[carrier == "AA", 
+       .(m_arr = mean(arr_delay), m_dep = mean(dep_delay)), 
+       by = .(origin, dest, month)]
+```
+
+**Sorted by `keyby`**
+```{r}
+# directly ordering by all the grouping variables
+# 'keyby' automatically orders the result by the grouping variables in increasing order
+flights[carrier == "AA", 
+       .(m_arr = mean(arr_delay), m_dep = mean(dep_delay)), 
+       keyby = .(origin, dest, month)]
+```
+
+**Chaining**\\
+Looking at getting the total number of trips for each `origin, dest` pair for carrier `AA`.
+```{r}
+ans <- flights[carrier == "AA", .N, by = .(origin, dest)]
+```
+Ordering the columns `origin` in ascending order, and `dest` in descending order:
+```{r}
+ans[order(origin, -dest)]
+```
+
+But, we can do this all in one go using *chaining*. We can tack expressions one
+after another, forming a chain of operations, i.e., `DT[ ... ][ ... ][ ... ]`.
+```{r}
+flights[carrier == "AA", .N, by = .(origin, dest)
+        ][order(origin, -dest)]
+```
+
+#### Expressions in `by`
+
+We can have *expressions* in the `by` index as well as columns. For example, if
+we would like to find out how many flights started late but arrived early (or
+on time), started and arrived late.
+```{r}
+flights[, .N, .(dep_delay > 0, arr_delay <= 0)]
+```
+
+#### Multiple columns in j
+
+What if we want to find the mean for lots of columns? We don't want to have to type `mean(col)` for each column individually.
+Here, due to the behaviour of DT[^note1], we can use the base function `lapply()`.
+
+[^note1]: [Tip:](https://cran.r-project.org/web/packages/data.table/vignettes/datatable-intro.html#tip-1) As long as the j-expression returns a list, each element of the list will be converted to a column in the resulting data.table.
+
+**Special symbol .SD**
+In `data.table`, we can create a **S**ubset of **D**ata using `.SD`. It is by itself a `data.table` that holds the data for the *current group* defined using `by`.
+
+
+```{r}
+DT = data.table(
+  ID = c("b","b","b","a","a","c"),
+  a = 1:6,
+  b = 7:12,
+  c = 13:18
+)
+DT
+```
+
+```{r}
+DT[, print(.SD), by = ID] # <1>
+```
+:::{.column-margin}
+- `.SD` contains all the columns except the grouping columns by default. 
+- It is also generated by preserving the original order - data corresponding to ID = "b", then ID = "a", and then ID = "c".
+:::
+
+To compute on multiple columns, we can use `lapply()`.
+```{r}
+DT[, lapply(.SD, mean), by = ID]
+```
+
+:::{.column-margin}
+- `.SD` holds the rows corresponding to columns a, b and c for that group. We compute the `mean()` on each of these columns using the already-familiar base function `lapply()`.
+- Each group returns a list of three elements containing the mean value which will become the columns of the resulting data.table.
+- Since `lapply()` returns a list, so there is no need to wrap it with an additional `.()`
+:::
+
+Can you `.SDcols` to specify just the columns we would like to compute the `mean()` on.
+```{r}
+flights[carrier == "AA",                       ## Only on trips with carrier "AA"
+        lapply(.SD, mean),                     ## compute the mean
+        by = .(origin, dest, month),           ## for every 'origin,dest,month'
+        .SDcols = c("arr_delay", "dep_delay")] ## for just those specified in .SDcols
+```
+
+Subset `.SD` for each group: for example, just returning the first two rows for each month.
+
+```{r}
+flights[, head(.SD, 2), by = month]
+```
+
+Concatenate columns a and b for each group in ID.
+
+:::{.column-margin}
+Recall that `DT` is 
+```{r}
+#| echo: false
+DT
+```
+:::
+
+```{r}
+DT[, .(val = c(a,b)), by = ID]
+```
+
+Or, returning as a list column.
+
+```{r}
+DT[, .(val = list(c(a,b))), by = ID]
+```
+
+:::{.callout-note}
+Once you start internalising usage in j, you will realise how powerful the
+syntax can be. A very useful way to understand it is by playing around, with
+the help of print(). Look at the difference between:
+```{r}
+## 
+DT[, print(c(a,b)), by = ID] 
+```
+and,
+```{r}
+DT[, print(list(c(a,b))), by = ID]
+```
+:::
+
+## Data and basic modelling
+
+Machine Learning
+: the process of learning models of relationships from data
+
+:::{.column-margin}
+machine learning
+:::
+
+Supervised Learning
+: a subfield of ML in which datasets consist of labelled observations. Each data
+point consists of features (variables to make predictions from), and a target
+(the quantity we are trying to predict).
+
+:::{.column-margin}
+supervised learning
+:::
+
+Regression
+: the prediction of numeric target values
+
+:::{.column-margin}
+regression
+:::
+
+Classification
+: the prediction of categorical values or labels
+
+:::{.column-margin}
+classification
+:::
+
+:::{.callout-note}
+# Tasks
+In {mlr3}, the datasets and their associated metadata are referred to as **tasks**.
+
+A 'task' refers to the prediction problem that we are trying to solve. They are
+defined by the features used for prediction and the targets to predict.
+Therefore, there can be multiple tasks associated with a dataset.
+
+For example, predicting mpg from horsepower is one task; predicting horsepower
+from mpg is another task; predicting the number of gears from the car's model
+is another task; *etc.*
+:::
+
+### The aim
+
+The aim of a supervised learning task is to build a model that captures the
+relationship between the features and the target, such that prediction can be
+made on new and previously unseen data.
+
+A model is a mapping from a features vector to a prediction, $f: X \rightarrow Y$,
+$$
+        f(x) = \hat y.
+$$
+
+Machine learning algorithms are called **learners** in {mlr3} as, given data,
+they learn models. Examples of learners include decision trees, support vector
+machines, and neural networks.
+
+:::{.column-margin}
+learners
+:::
+
+:::{.column-margin}
+In general, the model is trained on the training data and then the separate
+test data is used to evaluate models in an unbiased way, by assessing to what
+extent the model has learned the true relationships that underlie the data.
+This evaluation procedure estimates a model’s generalization error, i.e., how
+well we expect the model to perform in general. 
+:::
+
+This brief overview of ML provides the basic knowledge required to use {mlr3} and is summarized in @fig-ml-overview.
+
+![Overview of ML](./fig/mlr3book_figures-1.svg){#fig-ml-overview}
+
+## Tasks
+
+From here-in, we will be looking at the penguins dataset from {palmerpenguins}
+[@horst2020penguins]. We will first consider a regression task, and then
+a classification task afterwards.
+
+### Constructing tasks
+
+There are some premade tasks in {mlr3}'s Dictionary:
+
+```{r}
+mlr_tasks
+```
+
+We can retrieve a task using `tsk()`.
+
+```{r}
+tsk_mtcars = tsk("mtcars")
+tsk_mtcars 
+```
+
+:::{.callout-tip}
+# The help page
+In the R6 class, we can get to the help page in multiple ways:
+```r
+# option 1
+?mlr_tasks_mtcars
+# option 2
+tsk("mtcars")$help()
+```
+:::
+
+To construct a task using the penguins dataset, we need to construct a new instance of `TaskRegr`.
+Use the function `as_task_regr()` to convert a `data.frame` (or `tibble`) type object to a regression task.
+
+Using the {palmerpenguins} dataset, we will subset the data to only include columns `species`, `bill_length_mm`, and `body_mass_g`.
+We will set up a regression task called `pengs` in which we try and predict the body mass (in grams) from the species and the bill length (in mm).
+
+```{r}
+data("penguins", package = "palmerpenguins")
+
+penguins_dt <- as.data.table(penguins)
+penguins_dtsub <- penguins_dt[, .(species, bill_length_mm, body_mass_g)]
+penguins_dtsub <- na.omit(penguins_dtsub) # <1>
+tsk_penguins <- as_task_regr(penguins_dtsub, target = "body_mass_g", id = "pengs")
+tsk_penguins 
+```
+1. Removing `NA`s for simplicity here.
+
+
+:::{.column-margin}
+Playing around with `data.table`.
+```{r}
+# how many of each species
+penguins_dtsub[, .N, by = .(species)]
+# average bill length and body mass for each species
+penguins_dtsub[,
+               lapply(.SD, mean, na.rm = TRUE), 
+               by = .(species)]
+```
+:::
+
+We can plot the task using the {mlr3viz} package [@lang2025mlr3viz].
+
+```{r}
+#| warning: false
+
+autoplot(tsk_penguins, type = "pairs")
+```
+
+### Retrieving data
+
+The dimensions of the task can be retrieved using `$nrow` and `$ncol`:
+```{r}
+c(tsk_penguins$nrow, tsk_penguins$ncol)
+```
+
+The name of the feature and target columns can be retrieved:
+```{r}
+c(Features = tsk_penguins$feature_names,
+  Target = tsk_penguins$target_names)
+```
+
+The rows of the task are identified by row IDs (which do not necessarily correspond to row numbers).
+```{r}
+head(tsk_penguins$row_ids)
+```
+
+:::{.column-margin}
+Note that row IDs are not the same as row numbers. This is best demonstrated by
+example, below we create a regression task from random data, print the original
+row IDs, which correspond to row numbers 1-5, then we filter three rows (we
+will return to this method just below) and print the new row IDs, which no
+longer correspond to the row numbers.
+```{r}
+task = as_task_regr(data.frame(x = runif(5),
+                               y = runif(5)), 
+                    target = "y")
+task$row_ids
+```
+```{r}
+task$filter(c(4, 1, 3))
+task$row_ids
+```
+
+:::
+
+The data contained in a task can be accessed through `$data`.
+```{r}
+# retrieve all the data
+tsk_penguins$data()
+
+# retrieve data for rows with IDs 1, 5, and 10 and all feature columns
+tsk_penguins$data(rows = c(1, 5, 10), cols = tsk_penguins$feature_names)
+```
+
+:::{.callout-tip collapse = true}
+# Accessing rows by number 
+You can work with row numbers instead of row IDs by using the `$row_ids` field to
+extract the row ID corresponding to a given row number.
+```{r}
+# select the 2nd row of the task by extracting the second row_id:
+tsk_penguins$data(rows = tsk_penguins$row_ids[2])
+```
+:::
+
+Standard R methods can be used to extract summary data from a task, for example,
+```{r}
+summary(tsk_penguins)
+```
+
+### Task mutators
+
+Although we can access the data through `$data()`, if we want to modify it (for
+example, to create a train and test set), we need *mutator*. These modify the
+`Task` in place.
+
+- `$select()`: subset by features (column)
+- `$filter()`: subset by observations (rows)
+- `$cbind()`: add extra columns
+- `$rbind()`: add extra rows
+
+
+```{r}
+tsk_penguins_small = tsk_penguins$clone() # <1>
+tsk_penguins_small$select("species") # keep only one feature
+tsk_penguins_small$filter(2:3) # keep only these rows
+tsk_penguins_small$data()
+```
+1. As R6 uses [reference semantics](https://mlr3book.mlr-org.com/chapters/chapter1/introduction_and_overview.html#sec-r6), we need to use `$clone()` to ensure the original `Task` remains intact.
+
+```{r}
+tsk_penguins_small$cbind( # add an extra column
+         data.table(funny = c("yes", "no"))
+        )
+tsk_penguins_small$data()
+```
+
+## Learners
+
+In `mlr3`, a **Learner** represents a machine learning model or algorithm that
+can be trained and used to make predictions. It encapsulates everything needed
+to fit a model, make predictions, and evaluate performance, offering
+a consistent interface for different types of models.
+As with tasks, learners can be accessed from the dictionary with a single sugar function, `lrn()`.
+
+
+**Key Points:**
+
+- **Learner objects** are used to train and predict. They represent the type of model you want to use (e.g., decision trees, SVM, random forests).
+- Example: `lrn("classif.rpart")` creates a classification model using a decision tree. The `rpart` stands for *Recursive Partitioning and Regression Trees*.
+- Learners can be created using the `lrn()` function, with the argument specifying the model type (classification, regression, etc.) and the algorithm.
+- Common methods for Learners include:
+  - `train()` – trains the model on the provided data.
+  - `predict()` – makes predictions on new data.
+  - `score()` – evaluates the model's performance using various metrics.
+
+:::{.column-margin}
+```{r}
+lrn("regr.rpart")
+```
+:::
+
+All `Learner` objects include the following metadata, which can be seen in the output in the margin:
+
+- `$feature_types`: the type of features the learner can handle.
+- `$packages`: the packages required to be installed to use the learner.
+- `$properties`: the properties of the learner. For example, the “missings” properties means a model can handle missing data, and “importance” means it can compute the relative importance of each feature.
+- `$predict_types`: the types of prediction that the model can make.
+- `$param_set`: the set of available hyperparameters.
+
+The two stages that a learner passes through are shown in @fig-learner-stages.
+
+![To run a machine learning experiment, learners pass through two stages, `$train()` and `$predict()`.<br>
+Top – data (features and a target) are passed to an (untrained) learner.<br>
+Bottom – new data are passed to the trained model which makes predictions for the ‘missing’ target column.](./fig/mlr3book_figures-2.svg){#fig-learner-stages}
+
+### Training
+
+Models are trained by passing a task to a learner with the `$train()` method.
+
+```{r}
+# load a regression tree
+lrn_rpart = lrn("regr.rpart") # <1>
+# pass the task to the learner via $train()
+lrn_rpart$train(tsk_penguins)
+```
+1. The help file can be accessed as normal, `lrn_rpart$help()`.
+
+We can examine the model using `$model()`.
+```{r}
+# inspect the trained model
+lrn_rpart$model
+```
+We see that the regression tree has identified features in the task that are predictive of the target (`body_mass_g`) and used them to partition observations.
+
+#### Partitioning Data
+
+We can partition the data into a training and a test set (default size $2/3$ and $1/3$, respectively) using the `partition()` function.
+
+```{r}
+splits = partition(tsk_penguins)
+splits
+```
+
+When training we will tell the model to only use the training data by passing the row IDs from `partition` to the `row_ids` argument of `$train()`:
+
+```{r}
+lrn_rpart$train(tsk_penguins, row_ids = splits$train)
+```
+
+Now we can use our trained learner to make predictions on new data.
+
+#### Predicting
+
+To predict, we pass the data as a `Task` to the `$predict()` method of the trained `Learner`.
+
+```{r}
+prediction = lrn_rpart$predict(tsk_penguins, row_ids = splits$test) # <1>
+prediction
+```
+1. You can also use `$predict_newdata()` to pass a `data.frame` directly.
+
+We can plot `Prediction` objects using `{mlr3viz}`, shown in @fig-prediction-plot.
+
+```{r}
+#| fig-cap: Comparing predicted and ground truth values for the penguins dataset
+#| label: fig-prediction-plot
+
+autoplot(prediction)
+```
+
+### Hyperparameters{#sec-learners-hyperparameters}
+
+Hyperparameters are parameters of a machine learning model that are not learned from the data during training, but are set before the training process begins. They affect how the algorithm is run and can be set by the user.
+
+:::{.column-margin}
+Hyperparameters Key Points:
+
+- Model Settings: Hyperparameters determine how a model learns and the type of model used.
+  - Example for Decision Trees: Maximum tree depth or minimum number of samples per leaf.
+  - Example for SVM: Regularization parameter (`C`) and the kernel type.
+  - Example for Neural Networks: Learning rate, number of hidden layers, number of neurons per layer.
+- Not Learned: Hyperparameters are manually set before training and remain fixed during training, unlike parameters which are learned from the data.
+- Importance: Hyperparameters have a significant impact on model performance. The right choice can improve accuracy, while poor choices can lead to underfitting or overfitting.
+:::
+
+The hyperparameters can be accessed using `$param_set`.
+
+```{r}
+lrn_rpart$param_set # <1>
+```
+1. The output here is a `ParamSet` object, supplied by the [`paradox` package](https://paradox.mlr-org.com/)
+
+| Hyperparameter Class | Hyperparameter Type        |
+|----------------------|----------------------------|
+| `ParamDbl`           | Real-valued (numeric)      |
+| `ParamInt`           | Integer                    |
+| `ParamFct`           | Categorical (factor)       |
+| `ParamLgl`           | Logical / Boolean          |
+| `ParamUty`           | Untyped                    |
+
+
+The hyperparameters can be changed when constructing the `Learner`.
+
+```{r}
+lrn_rpart = lrn("regr.rpart", maxdepth = 1) # <1>
+
+# obtain a list of the non-default hyperparameters
+lrn_rpart$param_set$values # <2>
+```
+1. You can also change the default hyperparameters using `lrn_rpart$param_set$set_values(xval = 2, cp = 0.5)`.
+2. The `xval` hyperparameter is initialized to 0 because `xval` controls internal cross-validations and if a user accidentally leaves this at the default 10, model training can take an unnecessarily long time.
+
+We can see the `maxdepth` effect by looking at the learned regression tree.
+```{r}
+lrn_rpart$train(tsk_penguins)$model
+```
+
+#### Baseline Learners
+
+Baseline learners are very simple ('weak') learners, that can be used as
+baselines to test new models against. For example, `lrn("regr.featureless")`,
+will always predict new values to be the mean (or median, if the `robust`
+hyperparameter is set to `TRUE`) of the target in the training data.
+
+```{r}
+# generate data
+df = as_task_regr(data.frame(x = runif(1000), y = rnorm(1000, 2, 1)),
+  target = "y")
+lrn("regr.featureless")$train(df, 1:995)$predict(df, 996:1000)
+```
+
+## Evaluation
+
+Evaluating model performance is *probably a good idea*. Lets do this on our
+penguins decision tree example. Recall we have created a `Task`, and the data
+was split before being passed through a `Learner`. 
+
+```r
+# this code is for reference (it is not being run again).
+tsk_penguins <- as_task_regr(penguins_dtsub, target = "body_mass_g", id = "pengs")
+splits = partition(tsk_penguins)
+lrn_rpart$train(tsk_penguins, splits$train)
+prediction = lrn_rpart$predict(tsk_penguins, splits$test)
+```
+
+### Measures
+
+Models are evaluated using measures. The available measures are stored in the `mlr_measures` dictionary, which we can access using `msr()`.
+
+```{r}
+as.data.table(msr())
+```
+
+Lets consider the mean absolute error (MAE) `Measure`, which compares the absolute difference between the predicted and actual error,
+$$
+        f(y, \hat y) = |y - \hat y|.
+$$
+
+```{r}
+measure = msr("regr.mae")
+measure
+```
+
+This output is telling us the following:
+
+- Measure: Mean Absolute Error (MAE) for regression tasks.
+- Packages: mlr3, mlr3measures.
+- Range: $[0, \infty]$ (lower is better).
+- Minimize: True (aim to minimize the error).
+- Average: Macro average (averaged across all data points).
+- Parameters: There are no additional parameters.
+- Properties: There are no special properties associated with this measure
+- Predict type: Response (compares predicted values to actual values).
+
+### Scoring predictions
+
+We use a measure to score our predictions and evaluate the model.
+To do this we call the `$score()` method of a `Prediction` object and pass as
+a single argument the measure that we want to compute:
+
+```{r}
+prediction$score(measure) # <1>
+```
+1. Note that all task types have default measures that are used if the argument to `$score()` is omitted
+
+Multiple measures can be calculated at the same time:
+```{r}
+# mean squared error and mean absolute error
+measures = msrs(c("regr.mse", "regr.mae")) # <1>
+prediction$score(measures)
+```
+1. Note that the function is `msrs`, not `msr`, when there is more than one measure.
+
+:::{.callout-note collapse = true}
+# Obtaining meta-information using measures
+Some measures do not quantify the quality of the model, but instead give us some information. For example:
+
+- `msr("time_train")` – The time taken to train a model.
+- `msr("time_predict")` – The time taken for the model to make predictions.
+- `msr("time_both")` – The total time taken to train the model and then make predictions.
+- `msr("selected_features")` – The number of features selected by a model, which can only be used if the model has the “selected_features” property.
+
+```{r}
+measures = msrs(c("time_train", "time_predict", "time_both"))
+prediction$score(measures, learner = lrn_rpart) # <1>
+```
+1. We had to pass `learner = lrn_rpart` to `$score()` as these measures have
+   the `requires_learner` property, which can be seen from
+   `msr("time_train")$properties`.
+
+:::
+
+
+##  Let's Regress!
+
+I will put everything together now and assess the quality of the predictions.
+I'll do this by comparing the performance of a featureless regression learner
+to a decision tree with changed hyperparameters. I looked at the list of available hyperparameters in @sec-learners-hyperparameters
+
+```{r}
+#| lst-label: lst-lets-regress
+#| lst-cap: Regressing on {palmerpenguins}
+
+set.seed(349)
+# load and partition our task
+tsk_penguins <- as_task_regr(penguins_dtsub, target = "body_mass_g", id = "pengs")
+splits = partition(tsk_penguins)
+# load featureless learner
+lrn_featureless = lrn("regr.featureless")
+# load decision tree and set hyperparameters
+lrn_rpart = lrn("regr.rpart", cp = 0.2, maxdepth = 5) # <1>
+# load MSE and MAE measures
+measures = msrs(c("regr.mse", "regr.mae"))
+# train learners
+lrn_featureless$train(tsk_penguins, splits$train)
+lrn_rpart$train(tsk_penguins, splits$train)
+# make and score predictions
+lrn_featureless$predict(tsk_penguins,
+                        splits$test)$score(measures)
+```
+1. The complexity parameter (`cp`) controls the size of the tree by determining
+   the minimum improvement required for a further split. Default is 0.1.
+
+```{r}
+lrn_rpart$predict(tsk_penguins, splits$test)$score(measures)
+```
+
+For both MSE and MAE, lower values are ‘better’ (`Minimize: TRUE`) and
+therefore I am concluding (for now) that the decision tree performs better than
+the featureless baseline. Later, I'll look at formalising this conclusion using benchmarking.
+
+# Classification
+
+## A classification experiment
+
+The code below is very similar to that given in @lst-lets-regress, except that
+the tasks, learners and measures inherit from [`TaskClassif`](https://mlr3.mlr-org.com/reference/TaskClassif.html), [`LearnerClassif`](https://mlr3.mlr-org.com/reference/LearnerClassif.html), and [`MeasureClassif`](https://mlr3.mlr-org.com/reference/MeasureClassif.html), respectively.
+
+```{r}
+set.seed(349)
+# load and partition our task
+tsk_penguins = tsk("penguins")
+splits = partition(tsk_penguins)
+# load featureless learner
+lrn_featureless = lrn("classif.featureless") # <1>
+# load decision tree and set hyperparameters
+lrn_rpart = lrn("classif.rpart", cp = 0.2, maxdepth = 5)
+# load accuracy measure
+measure = msr("classif.acc") # <2>
+# train learners
+lrn_featureless$train(tsk_penguins, splits$train)
+lrn_rpart$train(tsk_penguins, splits$train)
+# make and score predictions
+lrn_featureless$predict(tsk_penguins, splits$test)$score(measure)
+lrn_rpart$predict(tsk_penguins, splits$test)$score(measure)
+```
+1. By default, the featureless learner always predicts the most common class in the training data.
+2. The measure calculates the number of correct predictions divided by total number of predictions
+
+So, classification and regression is very similar in {mlr3}. Let's look at the differences.
+
+### TaskClassif
+
+I can create a classifier task using `as_task_classif`,
+
+```{r}
+tsk_penguins <- as_task_classif(palmerpenguins::penguins, target = "species")
+tsk_penguins
+```
+
+As the target in the penguins dataset has three outcomes, this is multiclass classification (as seen in the `Properties` row above. If the outcome has only two options, then it would be binary classification.
+
+```{r}
+tsk_penguins$class_names
+```
+
+For binary classification, the 'positive' class is by default the smaller class. This can be changed during the task classification with the `positive = ` argument, or after by *e.g.* `tsk_classif$positive = "M"`.
+
+The task can be plotted using [autoplot.TaskClassif](https://mlr3viz.mlr-org.com/reference/autoplot.TaskClassif.html).
+
+```{r}
+#| warning: false
+#| fig-asp: 1
+
+autoplot(tsk_penguins, type = "duo") +
+  theme(strip.text.y = element_text(angle = -0, size = 8))
+```
+
+### LearnerClassif and MeasureClassif
+
+Classification learners can either predict the outcome class, or the probability of belonging to each class.
+
+```{r}
+# to obtain class predictions
+#lrn_rpart = lrn("classif.rpart", predict_type = "response")
+# to obtain probability predictions
+lrn_rpart = lrn("classif.rpart", predict_type = "prob")
+lrn_rpart$train(tsk_penguins, splits$train)
+prediction = lrn_rpart$predict(tsk_penguins, splits$test)
+prediction
+```
+
+The `response` in the output above is by default the class with the highest predicted probability.
+
+The measures available are difference for `response` predictions (require `predict_type = "response"`) and `prob` predictions (require `predict_type = "prob"`).
+A list of measures for the `multiclass` task, and the probability learners can be seen below.
+
+```{r}
+as.data.table(msr())[
+    task_type == "classif" & predict_type == "prob" &
+    !sapply(task_properties, function(x) "twoclass" %in% x)] # <1>
+```
+1. Removing the measures for binary classification.
+
+We can evaluate the quality of our probability predictions and response
+predictions simultaneously by providing multiple measures. Let's consider the
+[Brier score](https://en.wikipedia.org/wiki/Brier_score) (between [0, 1], where
+0 is best), the log-loss (negative logarithm of the predicted probability for
+the true class), and the accuracy (number of correct predictions divided by
+total number of predictions).
+
+### PredictionClassif
+
+[`PredictionClassif`](https://mlr3.mlr-org.com/reference/PredictionClassif.html)
+objects have two important differences to the regression versions -- the added field `$confusion`, and the added method `$set_threshold()`.
+
+```{r}
+measures = msrs(c("classif.mbrier", "classif.logloss", "classif.acc"))
+prediction$score(measures)
+```
+
+We can obtain the confusion matrix from the prediction obtain.
+
+```{r}
+#| fig-cap: Counts of each class label in the ground truth data (left) and predictions (right). 
+
+prediction$confusion
+```
+All off-diagonal entries are incorrectly classified observations, and all diagonal entries are correctly classified.
+
+```{r}
+autoplot(prediction)
+```
+
+For changing the threshold of the predicted probabily to select a class, see the [{mlr3} Threshold section](https://mlr3book.mlr-org.com/chapters/chapter2/data_and_basic_modeling.html#thresholding). One quick example shows the use of inverse veighting to obtain a model that more accurately captures the underlying relationship between classes.
+
+:::{.column-margin}
+In multiclass classification, thresholding works by first assigning a threshold
+to each of the n classes, dividing the predicted probabilities for each class
+by these thresholds to return n ratios, and then the class with the highest
+ratio is selected.
+:::
+
+```{r}
+tsk_zoo = tsk("zoo")
+tsk_zoo
+splits = partition(tsk_zoo)
+lrn_rpart = lrn("classif.rpart", predict_type = "prob")
+lrn_rpart$train(tsk_zoo, splits$train)
+prediction = lrn_rpart$predict(tsk_zoo, splits$test)
+before = autoplot(prediction) + ggtitle("Default thresholds")
+new_thresh = proportions(table(tsk_zoo$truth(splits$train)))
+new_thresh
+```
+
+```{r}
+prediction$set_threshold(new_thresh)
+after = autoplot(prediction) + ggtitle("Inverse weighting thresholds")
+before + after + plot_layout(guides = "collect")
+```
+
+
+# Learning algorithms
+
+The `mlr3learners` package contains a selection of algorithms (and select implementations) chosen by the `mlr` team that we recommend as a good starting point for most experiments:
+
+- Linear (`"regr.lm"`) and logistic (`"classif.log_reg"`) regression.
+- Penalized generalized linear models, where the penalization is either exposed as a hyperparameter (`"regr.glmnet"`/`"classif.glmnet"`) or where it is optimized automatically (`"regr.cv_glmnet"`/`"classif.cv_glmnet"`).
+- Weighted -Nearest Neighbors (`"regr.kknn"`/`"classif.kknn"`).
+- Kriging / Gaussian process regression (`"regr.km"`).
+- Linear (`"classif.lda"`) and quadratic (`"classif.qda"`) discriminant analysis.
+- Naïve Bayes classification (`"classif.naive_bayes"`).
+- Support-vector machines (`"regr.svm"`/`"classif.svm"`).
+- Gradient boosting (`"regr.xgboost"`/`"classif.xgboost"`).
+- Random forests for regression and classification (`"regr.ranger"`/`"classif.ranger"`).
+
+# Conclusion
+
+| Class       | Constructor/Function          | Fields/Methods                                      |
+|------------|-----------------------------|--------------------------------------------------|
+| Task       | `tsk()`/`tsks()`/`as_task_X` | `$filter(); $select(); $data()`                  |
+| Learner    | `lrn()`/`lrns()`             | `$train(); $predict(); $predict_newdata(); $model()` |
+| Prediction | `some_learner$predict()`     | `$score(); $set_threshold(); $confusion`         |
+| Measure    | `msr()`/`msrs()`             | `-`                                              |
+
+# Exercises
+
+### Question 1 {#sec-question-one}
+Train a classification model with the `"classif.rpart"` learner on the Pima
+Indians Diabetes dataset. Do this without using `tsk("pima")`, and instead by
+constructing a task from the dataset in the `mlbench` package:
+`data(PimaIndiansDiabetes2, package = "mlbench")`.
+
+:::{.callout-note collapse = true}
+# Missing data
+
+Note: The dataset has `NA`s
+in its features. You can either rely on `rpart`'s capability to handle them
+internally (surrogate splits) or remove them from the initial `data.frame`
+using `na.omit()`.
+
+The rpart algorithm has a built-in method called surrogate splits, which allows
+it to handle missing values without removing data. If a feature value is
+missing at a particular split, rpart:
+
+1.	Tries to use an alternative feature (a surrogate variable) that closely
+    mimics the main splitting feature.
+2.	If no good surrogate is found, it assigns the most common class (for
+    classification) or the mean value (for regression) within that split.
+
+:::
+
+  - Make sure to define the `pos` outcome as the positive class.
+  - Train the model on a random 80% subset of the given data and evaluate its
+    performance with the classification error measure on the remaining data.
+
+#### Answer
+
+Loading the data:
+
+```{r}
+data(PimaIndiansDiabetes2, package = "mlbench")
+pima <- as.data.table(PimaIndiansDiabetes2)
+pima
+```
+
+I want to predict whether each person has diabetes, using a CART
+('classification and regression tree').
+
+##### Creating a task 
+
+First, I create the `task`. I am defining `pos` to be the positive class in
+this step. It can also be done later by setting `tsk_pima$positive = "pos"`.
+
+```{r}
+tsk_pima <- as_task_classif(pima, target = "diabetes", positive = "pos")
+tsk_pima
+```
+
+```{r}
+#| warning: false
+#| fig-asp: 1
+#| fig-width: 7.5
+#| fig-cap: A pairs plot of the `pima` dataset. Note that it is unbalanced, as there are more negative diabetes outcomes than positive.
+#| label: fig-pima-pairs
+
+#autoplot(tsk_pima, type = "duo") +
+  #theme(strip.text.y = element_text(angle = -0, size = 8))
+
+autoplot(tsk_pima, type = "pairs")
+```
+
+Let's see how unbalanced the data is...
+
+```{r}
+pima[, .N, by = "diabetes"]
+```
+
+##### Splitting the data
+
+Create a split of $80\%$ training and $20\%$ test data.
+
+:::{.callout-important}
+I know this is bad practice. Most of the time (see below for caveats), all the
+data should be used to fit the model, and then internal validation done via resampling (*e.g.* using
+bootstrap or cross-validation).
+
+From Frank Harrell's [blog](https://www.fharrell.com/post/split-val/),
+
+> data splitting is an unstable method for validating models or classifiers,
+especially when the number of subjects is less than about 20,000 (fewer if
+signal:noise ratio is high). This is because were you to split the data again,
+develop a new model on the training sample, and test it on the holdout sample,
+the results are likely to vary significantly. Data splitting requires
+a significantly larger sample size than resampling to work acceptably well
+
+Also see @steyerberg2018validation.
+
+To chose whether to do internal or external validation, see the Biostatistics
+for Biomedical Research
+[summary](https://hbiostat.org/bbr/reg.html#summary-choosing-internal-vs.-external-validation).
+
+:::
+
+```{r}
+set.seed(52)
+splits <- partition(tsk_pima, ratio = 0.8)
+splits
+```
+
+##### Training the model
+
+Now, I will train the classification tree on the training data.
+
+
+```{r}
+# loading the learners
+lrn_featureless <- lrn("classif.featureless", predict_type = "prob")
+lrn_rpart <- lrn("classif.rpart", predict_type = "prob") # 'prob' is the default prediction type
+lrn_rpart
+
+# training the learners
+lrn_featureless$train(tsk_pima, splits$train)
+lrn_rpart$train(tsk_pima, splits$train)
+```
+
+
+##### Evaluating the model {#sec-question-one-evaluating}
+
+Here, I'm evaluating the model on the test data (and comparing against the
+featureless learner).
+
+I will consider the Brier, log-loss and accuracy `measures`.
+The [Brier score](https://en.wikipedia.org/wiki/Brier_score) lies between [0,
+1], where 0 is best. The log-loss is the negative logarithm of the predicted
+probability for the true class, and the accuracy is the number of correct
+predictions divided by total number of predictions.
+
+```{r}
+# load accuracy measures
+measures = msrs(c("classif.mbrier", "classif.logloss", "classif.acc"))
+
+# predicting using the featureless learner
+prediction_featureless <- lrn_featureless$predict(tsk_pima, splits$test)
+prediction_featureless 
+```
+```{r}
+# obtaining score of featureless learner
+prediction_featureless$score(measures)
+```
+```{r}
+# predicting using the classification tree
+prediction_rpart <- lrn_rpart$predict(tsk_pima, splits$test)
+prediction_rpart 
+```
+```{r}
+# obtaining score of the classification tree
+prediction_rpart$score(measures) 
+```
+
+```{r}
+# confusion matrix
+prediction_rpart$confusion # <1>
+```
+1. All off-diagonal entries are incorrectly classified observations, and all diagonal entries are correctly classified.
+
+```{r}
+prediction_plot <- autoplot(prediction_rpart) + ggtitle("Default")
+prediction_plot
+```
+
+
+### Question 2
+Calculate the true positive, false positive, true negative, and false negative rates of the predictions made by the model in Exercise 1.
+
+  - Try to solve this in two ways:
+    1. Using `mlr3measures`-predefined measure objects.
+    2. Without using `mlr3` tools by directly working on the ground truth and prediction vectors.
+  - Compare the results.
+
+#### Answer
+
+I've already started this in Question 1 (@sec-question-one-evaluating), but I will
+reiterate here. The confusion matrix gives the number of predictions that are
+correct (true positives or negatives) on the diagonal, and those that are incorrect (false
+positives and negatives) on the top right and bottom left, respectively
+
+```{r}
+# confusion matrix
+conf_matrix <- prediction_rpart$confusion
+conf_matrix
+```
+
+I want to obtain the *rates*, both using the
+[`mlr3measures`](https://mlr3.mlr-org.com/reference/mlr_measures.html) objects,
+and without.
+
+:::{.column-margin}
+
+Sensitivity
+: (true positive rate) is the probability of a positive test result, conditioned on the individual truly being positive.
+
+Specificity
+: (true negative rate) is the probability of a negative test result, conditioned on the individual truly being negative.
+
+:::
+
+##### Using `mlr3measures`
+
+First, let's figure out the measures we need...
+
+```{r}
+as.data.table(mlr_measures)[task_type == "classif" & predict_type == "response"]
+```
+
+OK, so we need to use the measures `classif.tpr` `classif.fpr` `classif.tnr`
+and `classif.fnr`, for the true positive, false positive, true negative and
+false negative rates, respectively.
+
+```{r}
+measures <- msrs(c("classif.tpr", "classif.fpr", "classif.tnr", "classif.fnr"))
+prediction_rpart$score(measures)
+```
+
+##### Without using `mlr3measures`
+
+I can obtain these rates directly from the confusion matrix.
+
+```{r}
+str(conf_matrix)
+
+# true positive rate / sensitivity
+tpr <- conf_matrix[1, 1]/ sum(conf_matrix[, 1])
+# false positive rate
+fpr <- conf_matrix[1, 2]/ sum(conf_matrix[, 2])
+
+# true negative rate / specificity
+tnr <- conf_matrix[2, 2]/ sum(conf_matrix[, 2])
+# false negative rate
+fnr <- conf_matrix[2, 1]/ sum(conf_matrix[, 1])
+
+data.table(
+  classif.tpr = tpr,
+  classif.fpr = fpr,
+  classif.tnr = tnr,
+  classif.fnr = fnr
+)
+```
+
+
+### Question 3
+Change the threshold of the model from Question 1 such that the false positive rate is lower than the false negative rate.
+
+- What is one reason you might do this in practice?
+
+#### Answer
+
+One reason I might want a lower false positive rate than false negative rate is it the damage done by a false positive is higher than that done by a false negative. That if, if classifying the outcome as positive when it is actually negative is more damaging than the other way round. For example, if I am building a model to predict fraud for a bank, and a false positive would result in a customer transaction being wrongly declined. Lots of false positives could result in annoyed customers and a loss of trust.
+
+##### Inverse weights
+
+Let's first change the thresholds such that they account for the inbalanced data. I'm not considering false positives here.
+
+From @fig-pima-pairs, it's clear that the data is unbalanced (more people with
+negative diabetes than positive). I can account for this by changing the
+thresholds using inverse weightings.
+
+First, let's use the training data to obtain new thresholds.
+
+```{r}
+new_thresh = proportions(table(tsk_pima$truth(splits$train)))
+new_thresh
+```
+
+And then I'll use these thresholds to reweight the model.
+
+```{r}
+prediction_rpart$set_threshold(new_thresh)
+prediction_rpart$confusion
+prediction_plot_newt <- autoplot(prediction_rpart) +
+                                ggtitle("Inverse weighting thresholds")
+prediction_plot + prediction_plot_newt +
+        plot_layout(guides = "collect")
+```
+
+Oh, it doesn't make a difference!
+
+##### Reducing false positive rate
+
+This can be achieved by making it more difficult for the model to predict a positive result.
+
+So, let's create thresholds where the `pos` result is penalised.
+
+```{r}
+new_thresh <- c("pos" = 0.7, "neg" = 0.3)
+```
+
+```{r}
+prediction_rpart$set_threshold(new_thresh)
+prediction_rpart$confusion
+measures <- msrs(c("classif.tpr", "classif.fpr", "classif.tnr", "classif.fnr"))
+prediction_rpart$score(measures)
+prediction_plot_newt <- autoplot(prediction_rpart) +
+                                ggtitle("New thresholds")
+prediction_plot + prediction_plot_newt +
+        plot_layout(guides = "collect")
+```
+
+Here, the false positive rate has decreased, but the false negative has increased (as expected).
+
+
