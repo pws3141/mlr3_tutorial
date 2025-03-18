@@ -18,6 +18,7 @@ reference-location: margin
 citation-location: margin
 fig-cap-location: margin
 tbl-cap-location: margin
+lst-cap-location: margin
 link-citations: true
 ---
 
@@ -34,7 +35,7 @@ For information on the `data.table` format, see the package [vignette](https://c
 
 This article follows the tutorial given in the *Applied Machine Learning Using
 mlr3 in R*
-[online notes](https://mlr3book.mlr-org.com/chapters/chapter3/evaluation_and_benchmarking.html)
+[online notes](https://mlr3book.mlr-org.com/chapters/chapter3/evaluation_and_benchmarking.html) [@casalicchio2024evaluation].
 
 ```{r}
 library(mlr3)
@@ -268,7 +269,7 @@ design = benchmark_grid(tasks, learners, rsmp_cv5)
 design
 ```
 
-Then we can run and experiement on the benchmark design.
+Then we can run an experiement on the benchmark design.
 
 ```{r}
 #| echo: false
@@ -285,7 +286,7 @@ bmr
 bmr
 ```
 
-As `benchmark()` is an extensive of `resample()`, we can obtain the score, and
+As `benchmark()` is an extension of `resample()`, we can obtain the score, and
 aggregate in the same way.
 
 ```{r}
@@ -297,7 +298,215 @@ Here, we can possibly conclude that the random forest is the best of all three
 models on each task, although some analysis will have to be done to assert
 this confidently.^[How to do this analysis comes much later in the {mlr3} [tutorial](https://mlr3book.mlr-org.com/chapters/chapter11/large-scale_benchmarking.html#sec-benchmark-analysis)]
 
-## BenchmarkResult objects
+### BenchmarkResult objects
 A `BenchmarkResult` object is a collection of multiple `ResampleResult` objects.
+It stores and organizes the results of benchmarking multiple machine learning
+models (`Learners`) on one or more tasks. It is created when you run a benchmark
+experiment using `benchmark()`.
+
+```{r}
+bmrdt = as.data.table(bmr)
+bmrdt[, .(task, learner, resampling, iteration)]
+```
+
+The `ResampleResults` can be extracted via the `$resample_result(i)`.
+
+```{r}
+rr1 = bmr$resample_result(1)
+rr1
+rr2 = bmr$resample_result(2)
+```
+
+And, `as_benchmark_result()` can be used to convert objects from `ResampleResult` to `BenchmarkResult`.
+
+```{r}
+bmr1 = as_benchmark_result(rr1)
+bmr2 = as_benchmark_result(rr2)
+
+c(bmr1, bmr2)
+```
+
+```{r}
+#| fig-cap: Boxplots of accuracy scores for each learner across resampling iterations and the three tasks.
+autoplot(bmr, measure = msr("classif.acc"))
+```
 
 # Evaluating Binary Classifiers {#sec-binary-classification}
+
+Here, we look at using the confusion matrix (@sec-binary-confusion), and ROC analysis (@sec-binary-roc) to evaluate binary classifiers.
+
+## Confusion matrix {#sec-binary-confusion}
+
+Confusion matrices give:
+
+- True positives (TPs): Positive instances that are correctly classified as positive.
+- True negatives (TNs): Negative instances that are correctly classified as negative.
+- False positives (FPs): Negative instances that are incorrectly classified as positive.
+- False negatives (FNs): Positive instances that are incorrectly classified as negative.
+
+```{r}
+tsk_german = tsk("german_credit")
+lrn_ranger = lrn("classif.ranger", predict_type = "prob")
+splits = partition(tsk_german, ratio = 0.8)
+
+lrn_ranger$train(tsk_german, splits$train)
+prediction = lrn_ranger$predict(tsk_german, splits$test)
+prediction$score(msr("classif.acc"))
+```
+```{r}
+#| lst-label: lst-binary-confusion
+#| lst-cap: The confusion matrix for the random forest learner on the 'german_credit' data.
+prediction$confusion
+```
+
+Here, although the accuracy score might be OK, it is clear that the predictions
+are not very good at correctly predicting the 'bad' outcomes.
+
+Normalised measures can be used to account for class imbalances.
+
+- True Positive Rate (TPR), Sensitivity or Recall: How many of the true positives did we predict as positive?
+- True Negative Rate (TNR) or Specificity: How many of the true negatives did we predict as negative?
+- False Positive Rate (FPR), or $1 -$ Specificity: How many of the true negatives did we predict as positive?
+- Positive Predictive Value (PPV) or Precision: If we predict positive how likely is it a true positive?
+- Negative Predictive Value (NPV): If we predict negative how likely is it a true negative?
+- Accuracy (ACC): The proportion of correctly classified instances out of the total number of instances.
+- F1-score: The harmonic mean of precision and recall, which balances the trade-off between precision and recall. It is calculated as
+
+$$
+2 \times \frac{\text{Precision} \times \text{Recall}}{{Precision} + \text{Recall}}
+$$
+
+![Binary confusion matrix of ground truth class vs. predicted class](./fig/confusion_matrix.svg)
+
+These measures can be computed using the `{mlr3measures}` package.
+
+```{r}
+mlr3measures::confusion_matrix(truth = prediction$truth,
+  response = prediction$response, positive = tsk_german$positive)
+```
+
+The false positive rate is quite high, as expected from looking at the
+confusion matrix obtained from `prediction$confusion` in @lst-binary-confusion.
+There is generally a trade off between FPR and TPR. Using `predict_type
+= "prob"` to obtain predicted probabilities of being in the positive class, we
+can change the threshold to cut off when we assign observations to the positive
+/ negative class. Increasing this threshold for identifying positive cases will
+lead to a higher number of negative predictions -- therefore a lower (better)
+FPR but a lower (worse) TPR (and vice-versa).
+
+## ROC analysis {#sec-binary-roc}
+
+ROC (Receiver Operating Characteristic) analysis is widely used to evaluate
+binary classifiers by visualizing the trade-off between the TPR and the FPR.
+
+We can use the previous `Prediction` object to compute all possible TPR and FPR
+combinations by thresholding the predicted probabilities across all possible
+thresholds
+This is what is done in `mlr3viz::autoplot.PredictionClassif` when `type = "roc"` is chosen.
+FPR is on the $x$-axis, and TPR on the $y$-axis.
+
+```{r}
+autoplot(prediction, type = "roc")
+```
+
+The area under the curve (AUC) of a ROC can be interprested as the probability
+that a randomly chosen positive instance has a higher predicted probability of
+belonging to the positive class than a randomly chosen negative instance.
+
+```{r}
+prediction$score(msr("classif.auc"))
+```
+
+The precision-recall curve (PRC) can also be plotted. This visualises the precision (PPV) vs. recall (TPR). The main difference between PRC and ROC is that true-negatives are ignored in the former, which can be useful in imbalanced populations where the positive class is rare.
+
+```{r}
+autoplot(prediction, type = "prc")
+```
+
+We can also see how the performance metrics change with respect to the threshold. Here, we plot the FPR and the accuracy.
+
+```{r}
+#| fig.width: 7.5
+#| fig.asp: 0.5
+#| label: Comparing threshold and FPR (left) with threshold and accuracy (right) for the random forest trained on tsk("german_credit").
+
+gg1 <- autoplot(prediction, type = "threshold", measure = msr("classif.fpr"))
+gg2 <- autoplot(prediction, type = "threshold", measure = msr("classif.acc"))
+
+gg1 + gg2
+```
+
+We can look at the variability for each resampling iteration via the `ResampleResult` object.
+
+```{r}
+#| fig.width: 7.5
+#| fig.asp: 0.5
+
+rr = resample(
+  task = tsk("german_credit"),
+  learner = lrn("classif.ranger", predict_type = "prob"),
+  resampling = rsmp("cv", folds = 5)
+)
+
+gg1 <- autoplot(rr, type = "roc")
+gg2 <- autoplot(rr, type = "prc")
+
+gg1 + gg2
+```
+
+And, we can use the `BenchmarkResult` to compare multiple learners on the same `Task`.
+
+```{r}
+#| fig.width: 8
+#| fig.asp: 0.5
+
+design = benchmark_grid(
+  tasks = tsk("german_credit"),
+  learners = lrns(c("classif.rpart", "classif.ranger"),
+    predict_type = "prob"),
+  resamplings = rsmp("cv", folds = 5)
+)
+bmr = benchmark(design)
+
+autoplot(bmr, type = "roc") + autoplot(bmr, type = "prc") +
+  plot_layout(guides = "collect")
+```
+
+:::{.column-margin}
+I'm not sure why in the ROC plot, the $y$-axis is labeled as 'Sensitivity', whilst in the PRC, the $x$-axis is labeled 'Recall'. Maybe it's due to historical reasons?
+:::
+
+# Conclusion
+
+Here, we learned how to estimate the generalisation performance of a model via resampling (holdout, CV, bootstrap), and how to automate the comparison of multiple learners in benchmark experiments.
+
+| Class               | Constructor/Function      | Fields/Methods                                                       |
+|---------------------|-------------------------|----------------------------------------------------------------------|
+| `PredictionClassif` | `classif_lrn$predict()`  | `confusion_matrix()`; `autoplot(some_prediction_classif, type = "roc")` |
+| -                  | `partition()`            | -                                                                  |
+| `Resampling`       | `rsmp()`                 | `$instantiate()`                                                     |
+| `ResampleResult`   | `resample()`             | `$score()`; `$aggregate()`; `$predictions()`; `as_benchmark_result()`; `autoplot(some_resample_result, type = "roc")` |
+| -                  | `benchmark_grid()`       | -                                                                  |
+| `BenchmarkResult`  | `benchmark()`            | `$aggregate()`; `$resample_result()`; `$score()`; `autoplot(some_benchmark_result, type = "roc")` |
+
+# Exercises
+
+1. Apply a repeated cross-validation resampling strategy on `tsk("mtcars")` and evaluate the performance of `lrn("regr.rpart")`.
+   - Use five repeats of three folds each.
+   - Calculate the MSE for each iteration and visualize the result.
+   - Finally, calculate the aggregated performance score.
+
+2. Use `tsk("spam")` and five-fold CV to benchmark `lrn("classif.ranger")`, `lrn("classif.log_reg")`, and `lrn("classif.xgboost", nrounds = 100)` with respect to AUC.
+   - Which learner appears to perform best?
+   - How confident are you in your conclusion?
+   - Think about the stability of results and investigate this by re-running the experiment with different seeds.
+   - What can be done to improve this?
+
+3. A colleague reports a 93.1% classification accuracy using `lrn("classif.rpart")` on `tsk("penguins_simple")`.
+   - You want to reproduce their results and ask them about their resampling strategy.
+   - They said they used a custom three-fold CV with folds assigned as `factor(task$row_ids %% 3)`.
+   - See if you can reproduce their results.
+
+4. (\*) Program your own ROC plotting function **without** using `mlr3`'s `autoplot()` function.
+   - The signature of your function should be `my_roc_plot(task, learner, train_indices, test_indices)`.
+   - Your function should use the `$set_threshold()` method of `Prediction`, as well as `mlr3measures`.
