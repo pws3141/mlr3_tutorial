@@ -1,0 +1,446 @@
+---
+title: "Applied Machine Learning Using mlr3"
+subtitle: "Hyperparameter Optimisation"
+author: "Paul Smith"
+date: today
+format:
+  html:
+    embed-resources: true
+    code-annotations: hover
+    grid:
+      margin-width: 350px
+    fig-width: 6
+    fig-asp: 0.618
+    toc: true
+    toc-location: left
+bibliography: ref.bib
+reference-location: margin
+citation-location: margin
+fig-cap-location: margin
+tbl-cap-location: margin
+lst-cap-location: margin
+link-citations: true
+---
+
+# Introduction and prerequisites
+
+These notes mirror [Section 4](https://mlr3book.mlr-org.com/chapters/chapter4/hyperparameter_optimization.html) of *Applied Machine Learning Using mlr3 in R* [@becker2024hyperparameter].
+
+Parameter
+: model coefficients or weights (or other information) that are determined by the learning algorithm based on the training data.
+
+Hyperparameter
+: configures by the user and determine how the model will fit its parameters
+(*i.e.* how the model is built).^[For example, the number of trees in a random
+forest, penalty settings in support vectors machines *etc*]
+
+The aim of hyperparameter optimisation (model tuning) is to find the optimal
+configuration of hyperparameters of a machine learning algorithm for a given
+task. There is no closed-form representation here, so it relies on resampling
+with different configurations and choosing the configuration with the best
+performance.
+
+Tuner
+: a hyperparameter optimisation method.
+
+![Representation of the hyperparameter optimization loop in mlr3tuning. Blue - Hyperparameter optimization loop. Purple - Objects of the tuning instance supplied by the user. Blue-Green - Internally created objects of the tuning instance. Green - Optimization Algorithm.](./fig/hyperparameter_optimisation.svg)
+
+```{r}
+library(mlr3)
+library(mlr3viz)
+library(mlr3learners)
+library(mlr3data)
+library(mlr3tuning)
+library(e1071)
+library(ggplot2)
+library(patchwork)
+library(data.table)
+options(datatable.print.nrows = 20)
+```
+
+Suppress all messaging unless it's a warning:^[The packages in `{mlr3}` that
+make use of optimization, i.e., `{mlr3tuning}` or `{mlr3fselec}`t, use the
+logger of their base package `{bbotk}`.]
+
+```{r}
+lgr::get_logger("mlr3")$set_threshold("warn")
+lgr::get_logger("bbotk")$set_threshold("warn")
+```
+
+
+## Structure
+
+This article is structured as follows:
+
+# Model Tuning {#sec-tuning-ti}
+
+The `{mlr3}` ecosystem uses the `{mlr3tuning}` package [@becker2025mlr3tuning] to perform hyperparameter optimisation, which has the R6 classes:
+
+- [TuningInstanceBatchSingleCrit](https://mlr3tuning.mlr-org.com/reference/TuningInstanceBatchSingleCrit.html): a tuning 'instance' that describes the optimisation problem and stores the results;
+- [TunerBatch](https://mlr3tuning.mlr-org.com/reference/TunerBatch.html): used to configure and run optimisation algorithms.
+
+In this section, we look at optimising an SVM classifier from [{e1071}](https://cran.r-project.org/web/packages/e1071/index.html) [@meyer2024e1071] on `tsk("sonar")`.
+
+## Learner and search space
+
+First look at the learner's possible hyperparameters to tune, using `$param_set`.
+
+```{r}
+as.data.table(lrn("classif.svm")$param_set)[,
+  .(id, class, lower, upper, nlevels)]
+```
+
+Search space (tuning space)
+: the subset of hyperparameters that are chosen to tune.
+
+Here, we will tune the numeric regularisation and kernel width hyperparameters `cost` and `gamma`.[^note1]
+
+[^note1]: From the `svg()` [man page](https://www.rdocumentation.org/packages/e1071/versions/1.7-16/topics/svm), we can see:
+
+    - `cost`: cost of constraints violation (default: 1)---it is the ‘C’-constant of the regularization term in the Lagrange formulation.
+    - `gamma`:     parameter needed for all kernels except linear (default: 1/(data dimension))
+
+For numerical hyperparameters, we need to set a range of values of search over, which is done using `to_tune()`.
+
+```{r}
+learner = lrn("classif.svm",
+  type  = "C-classification",
+  kernel = "radial",
+  cost  = to_tune(1e-1, 1e5),
+  gamma = to_tune(1e-1, 1)
+)
+learner
+```
+
+## Terminator
+
+Terminators are stored in the `mlr_terminators` dictionary and are constructed with the sugar function `trm()`.
+
+| Terminator           | Function Call and Default Parameters                          |
+|----------------------|---------------------------------------------------------------|
+| Clock Time           | `trm("clock_time")`                                            |
+| Combo                | `trm("combo", any = TRUE)`                                     |
+| None                 | `trm("none")`                                                  |
+| Number of Evaluations| `trm("evals", n_evals = 100, k = 0)`                           |
+| Performance Level    | `trm("perf_reached", level = 0.1)`                             |
+| Run Time             | `trm("run_time", secs = 30)`                                   |
+| Stagnation           | `trm("stagnation", iters = 10, threshold = 0)`                |
+
+: Terminators available in `{mlr3tuning}`. For an up-to-date list, see the [website](ttps://mlr-org.com/terminators.html).
+
+## Tuning instance with `ti`
+
+Tuning instance
+: collects the tuner-agnostic information required to optimise a model (*i.e.* all information about the tuning process, except for the tuning algorithm itself).^[This includes the task to tune over, the learner to tune, the resampling method and measure used, and the terminator.] 
+
+A tuning instance can be constructed explicitly with `ti()`, or the learner can be tuned with `tune()` (described in @sec-tuning-tune).
+
+First, let's constuct a single-objective tuning problem (*i.e.* tuning over one
+measure), by using `ti()` to create a `TuningInstanceBatchSingleCrit`. We will
+use three-fold CV and optimise the classification error measure. We will use
+the grid search tuner, so can use `trm("none")` as we want to iterate over the
+full grid without stopping too soon.
+
+```{r}
+tsk_sonar <- tsk("sonar")
+learner <- lrn("classif.svm",
+               cost = to_tune(1e-1, 1e5),
+               gamma = to_tune(1e-1, 1),
+               kernel = "radial",
+               type = "C-classification"
+               )
+
+instance <- ti(
+               task = tsk_sonar,
+               learner = learner,
+               resampling = rsmp("cv", folds = 3),
+               measures = msr("classif.ce"),
+               terminator = trm("none")
+               )
+
+instance
+```
+
+
+## Tuner
+
+Now we need to decide how to tune the model, which is done using a `Tuner` class.
+
+| Tuner                          | Function Call           | Package         |
+|-------------------------------|--------------------------|-----------------|
+| Random Search                 | `tnr("random_search")`   | mlr3tuning      |
+| Grid Search                   | `tnr("grid_search")`     | mlr3tuning      |
+| Bayesian Optimization         | `tnr("mbo")`             | mlr3mbo         |
+| CMA-ES                        | `tnr("cmaes")`           | adagio          |
+| Iterated Racing               | `tnr("irace")`           | irace           |
+| Hyperband                    | `tnr("hyperband")`       | mlr3hyperband   |
+| Generalized Simulated Annealing | `tnr("gensa")`         | GenSA           |
+| Nonlinear Optimization        | `tnr("nloptr")`          | nloptr          |
+
+: Tuning algorithms available in `{mlr3tuning}`. For a complete list, see the [website](https://mlr-org.com/tuners.html).
+
+Tuning can be either via *search strategies* (*e.g.* grid, or random search) or
+*adaptive algorithms* (*e.g.* Bayesian optimisation, CMA-ES^[which is an
+example of an evolutionary strategy]). For more information about these
+methods, see [Section
+4.1.4](https://mlr3book.mlr-org.com/chapters/chapter4/hyperparameter_optimization.html#sec-tuner)
+or the mlr3 tutorial.
+
+### Choosing strategies
+
+In low dimensions, often grid search may be used to exhaustively evaluate the
+search space in a reasonable time. However, when the search space gets large
+this is infeasible. From [Section
+4.1.4](https://mlr3book.mlr-org.com/chapters/chapter4/hyperparameter_optimization.html#sec-tuner):
+
+> If hyperparameter configurations can be evaluated quickly, evolutionary
+strategies often work well. On the other hand, if model evaluations are
+time-consuming and the optimization budget is limited, Bayesian optimization is
+usually preferred, as it is quite sample efficient compared to other
+algorithms, i.e., less function evaluations are needed to find good
+configurations. Hence, Bayesian optimization is usually recommended for HPO. 
+
+For the SVM example, we will use a grid search, with a $5 \times 5$ grid.
+
+```{r}
+tuner = tnr("grid_search", resolution = 5, batch_size = 10)
+tuner
+```
+
+The `resolution` and `batch_size` parameters are *control* parameters, specific to the grid search tuner.^[The `batch_size` parameter controls how many configurations are evaluated at the same time when parallisation is enables (see [Section 10.1.3](https://mlr3book.mlr-org.com/chapters/chapter10/advanced_technical_aspects_of_mlr3.html#sec-parallel-tuning))]
+
+```{r}
+tuner$param_set
+```
+
+#### Triggering the tuning process
+
+Now we can start the tuning process. We pass the contructed `TuningInstanceBatchSingleCrit` to the `$optimize()` method of the initialised `TunerBatch`, which triggers the hyperparameter optimisation loop.
+
+```{r}
+tuner$optimize(instance)
+```
+
+The optimizer returns the best hyperparameter configuration and the
+corresponding performance, this information is also stored in
+`instance$result`. The `$learner_param_vals` field of the `$result` lists the
+optimal hyperparameters from tuning, as well as any other hyperparameters that
+were set.
+
+```{r}
+#| lst-label: lst-instant-result
+#| lst-cap: Parameter values after tuning using a grid search.
+
+instance$result
+```
+
+```{r}
+instance$result$learner_param_vals
+```
+
+
+The `$x_domain` field is useful for hyperparameter transformation, which we look at briefly now (@sec-hyper-transformations).
+
+### Logarithmic transformations {#sec-hyper-transformations}
+
+If a hyperparameter has a large upper bound, tuning on a logarithmic scale can
+be more efficient than on a linear scale. After transform, the majority of the
+points are small, with a few being very large.
+
+```r
+cost = runif(1000, log(1e-5), log(1e5))
+exp_cost = exp(cost)
+```
+
+::: {layout-ncol=2}
+
+![](./fig/log_scale.png)
+
+![](./fig/log_scale2.png)
+
+Before (left) and after log-transform (right).
+:::
+
+```{r}
+#| lst-label: lst-instant-result-log
+#| lst-cap: Parameter values after tuning using a grid search and log-transform.
+
+learner = lrn("classif.svm",
+  cost  = to_tune(1e-5, 1e5, logscale = TRUE),
+  gamma = to_tune(1e-5, 1e5, logscale = TRUE),
+  kernel = "radial",
+  type = "C-classification"
+)
+
+instance = ti(
+  task = tsk_sonar,
+  learner = learner,
+  resampling = rsmp("cv", folds = 3),
+  measures = msr("classif.ce"),
+  terminator = trm("none")
+)
+
+tuner$optimize(instance)
+```
+
+This log-transform improved the hyperparameter search, as `classif.ce` is
+smaller than in @lst-instant-result. Note that the optimal parameters shown in
+@lst-instant-result-log are pre-transformation. To see the values after
+transformation -- that is, $e^x$ --  use `$x_domain`.
+
+```{r}
+instance$result$x_domain
+```
+
+More complex transformations are discussed in @sec-advanced-search-space.
+
+
+## Analysing and using the result
+
+We can examine all the hyperparameter configurations that were evaluated, using `$archive`.
+
+```{r}
+as.data.table(instance$archive)[, .(cost, gamma, classif.ce)]
+```
+
+Here, the columns show the tested configurations before transformation.^[That
+is why some are negative, even though cost and gamma values must be positive.
+E.g. $-11.512925 \approx \log(1\times 10^{-5})$] We can
+also look at other features, for example, time of evaluation, model runtime
+and any errors or warnings.
+
+```{r}
+as.data.table(instance$archive)[,
+  .(timestamp, runtime_learners, errors, warnings)]
+```
+
+All the resamplings combined (as a `BenchmarkResult` object) can be seen using `instance$archive$benchmark_result`
+
+```{r}
+instance$archive$benchmark_result
+```
+
+The visualisation of these results can be seen in @fig-instance-surface (which
+uses
+[autoplot.TuningInstanceBatchSingleCrit](https://mlr3viz.mlr-org.com/reference/autoplot.TuningInstanceBatchSingleCrit.html))
+
+```{r}
+#| fig-cap: Model performance with different configurations for cost and gamma. Bright yellow regions represent the model performing worse and dark blue performing better.
+#| label: fig-instance-surface
+
+autoplot(instance, type = "surface")
+```
+
+### Training an optimised model
+
+After we have found *good* hyperparameters for our learner through tuning, we can train the final model on the data.
+First, construct the learner with the 'optimal' hyperparameters.
+
+```{r}
+lrn_svm_tuned = lrn("classif.svm")
+lrn_svm_tuned$param_set$values = instance$result_learner_param_vals
+lrn_svm_tuned
+```
+
+And then train this learner on the data.
+
+```{r}
+lrn_svm_tuned$train(tsk_sonar)$model
+```
+
+## Tuning with `tune` and `auto_tuner` {#sec-tuning-tune}
+
+In @sec-tuning-ti we created a tuning instance (using `ti()`), passed this to the tuner, and then called `$optimize()` to start the tuning process.
+There are two helper methods in `{mlr3tuning}` to simplify this process -- `tune()` and `auto_tuner()`.
+
+The `tune()` function creates the tuning instance and calls `$optimize()`.
+That is, it skips the step of calling `tuner$optimize(instance)`.
+
+```{r}
+tnr_grid_search = tnr("grid_search", resolution = 5, batch_size = 5)
+lrn_svm = lrn("classif.svm",
+  cost  = to_tune(1e-5, 1e5, logscale = TRUE),
+  gamma = to_tune(1e-5, 1e5, logscale = TRUE),
+  kernel = "radial",
+  type = "C-classification"
+)
+rsmp_cv5 = rsmp("cv", folds = 5)
+msr_ce = msr("classif.ce")
+
+set.seed(10)
+instance = mlr3tuning::tune( #<1>
+  tuner = tnr_grid_search,
+  task = tsk_sonar,
+  learner = lrn_svm,
+  resampling = rsmp_cv5,
+  measures = msr_ce
+)
+instance$result
+```
+1. I have specificed the package here (`mlr3tuning::`), as there is also the function `e1071::tune()` and thus a namespace conflict.
+
+:::{.column-margin}
+The equivalent code using `ti()` involves specifying the tuner instance first and then triggering it.
+
+```{r}
+tuner = tnr("grid_search", resolution = 5, batch_size = 5)
+instance <- ti(
+               task = tsk_sonar,
+               learner = lrn_svm,
+               resampling = rsmp_cv5,
+               measures = msr_ce,
+               terminator = trm("none")
+               )
+
+set.seed(10)
+tuner$optimize(instance)
+instance$result
+```
+
+:::
+
+The `auto_tuner()` helper function creates an object of class
+[AutoTuner](https://mlr3tuning.mlr-org.com/reference/AutoTuner.html).
+It inherits from the `Learner` class and wraps the information needed for tuning, so that you can treat a learner waiting to be optimised just like any other learner.
+The `AutoTuner` runs `tune()` on the data that is passed to the model when `$train()` is called.
+
+![Illustration of an Auto-Tuner](./fig/autotuner.svg){width=50% fig-align="center"}
+
+```{r}
+#| lst-label: lst-auto-tuner
+#| lst-cap: Initialising the `auto_tuner()`
+
+at = auto_tuner(
+  tuner = tnr_grid_search,
+  learner = lrn_svm,
+  resampling = rsmp_cv5,
+  measure = msr_ce
+)
+
+at
+```
+
+Now, we can call `$train()`, which will first tune the hyperparameters in the
+search space given in the output from @lst-auto-tuner, and then fit the optimal
+model.
+
+```{r}
+set.seed(10)
+
+split <- partition(tsk_sonar)
+at$train(tsk_sonar, row_ids = split$train)
+at$predict(tsk_sonar, row_ids = split$test)$score()
+```
+
+We can also look at the tuning instance, as before.
+
+```{r}
+at$tuning_instance
+at$tuning_instance$result
+```
+
+Now, in @sec-nested-resampling below will discuss *nested resampling*, which involves passing the `AutoTuner` to `resample()` and `benchmark()`.
+
+# Nested Resampling {#sec-nested-resampling}
+
+# More Advanced Search Spaces {#sec-advanced-search-space}
