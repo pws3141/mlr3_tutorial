@@ -1,0 +1,21 @@
+# Quarto build directories
+_site/
+.quarto/
+
+# RStudio project files
+.Rproj.user/
+
+# R specific files
+.Rhistory
+.RData
+.Ruserdata
+
+# Common cache directories
+*_cache/
+cache/
+
+# Temporary files
+*.tmp
+*.swp
+*.lock
+
