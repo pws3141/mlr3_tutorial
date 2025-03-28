@@ -350,11 +350,13 @@ lrn_svm_tuned$train(tsk_sonar)$model
 
 ## Tuning with `tune` and `auto_tuner` {#sec-tuning-tune}
 
-In @sec-tuning-ti we created a tuning instance (using `ti()`), passed this to the tuner, and then called `$optimize()` to start the tuning process.
-There are two helper methods in `{mlr3tuning}` to simplify this process -- `tune()` and `auto_tuner()`.
+In @sec-tuning-ti we created a tuning instance (using `ti()`), passed this to
+the tuner, and then called `$optimize()` to start the tuning process.
+There are two helper methods in `{mlr3tuning}` to simplify this process --
+`tune()` and `auto_tuner()`.
 
-The `tune()` function creates the tuning instance and calls `$optimize()`.
-That is, it skips the step of calling `tuner$optimize(instance)`.
+The `tune()` function creates the tuning instance and calls `$optimize()`. That
+is, it skips the step of calling `tuner$optimize(instance)`.
 
 ```{r}
 tnr_grid_search = tnr("grid_search", resolution = 5, batch_size = 5)
@@ -443,4 +445,240 @@ Now, in @sec-nested-resampling below will discuss *nested resampling*, which inv
 
 # Nested Resampling {#sec-nested-resampling}
 
+Analogously to *optimism* when obtaining the predictive ability of a model
+trained on the same data set [see @harrell2001regression, Section 5.3.4], with
+HPO we also have to consider the bias due to
+the same data being used for determining the optimal configuration and the
+evaluation of the resulting model. Therefore, we need to do additional
+resampling to reduce this bias when evaluating the performance of a model.
+
+Nested resampling
+: a method to seperate the model optimisation from the process of estimating
+the performance of the tuned model, using additional resampling.^[The is, while
+model performance is estimated using a resampling method in the ‘usual way’,
+tuning is then performed by resampling the resampled data]
+
+![An illustration of nested resampling. The large blocks represent three-fold CV for the outer resampling for model evaluation and the small blocks represent four-fold CV for the inner resampling for HPO. The light blue blocks are the training sets and the dark blue blocks are the test sets.](./fig/nested_resampling.svg){#fig-nested-resampling-example}
+
+@fig-nested-resampling-example shows the following nested resampling example:
+
+1. Outer resampling start
+   - Perform 3-fold cross-validation on the full dataset.
+   - For each outer fold, split the data into:
+     - Training set (light blue blocks)
+     - Test set (dark blue block)
+
+2. Inner resampling
+   - Within each outer training set, perform 4-fold cross-validation.
+   - These inner folds are used for tuning hyperparameters (not evaluation).
+
+3. HPO – Hyperparameter tuning
+   - Use the inner training and validation sets to evaluate different hyperparameter combinations.
+   - Select the best hyperparameter configuration based on performance across inner folds.
+
+4. Training
+   - Fit the model on the entire outer training set using the tuned hyperparameters.
+
+5. Evaluation
+   - Evaluate the trained model on the outer test set (unseen during tuning).
+
+6. Outer resampling repeats
+   - Repeat steps 2–5 for each of the 3 outer folds.
+
+7. Aggregation
+   - Average the 3 outer test performance scores.
+   - This gives an unbiased estimate of the model’s generalisation performance with tuning.
+
+
+From the `{mlr3}` tutorial ([Section
+4.3](https://mlr3book.mlr-org.com/chapters/chapter4/hyperparameter_optimization.html#sec-nested-resampling)), 
+
+> A common mistake is to think of nested resampling as a method to select
+optimal model configurations. Nested resampling is a method to compare models
+and to estimate the generalization performance of a tuned model, however, this
+is the performance based on multiple different configurations (one from each
+outer fold) and not performance based on a single configuration (Section
+4.3.2). If you are interested in identifying optimal configurations, then use
+`tune()`/`ti()` or `auto_tuner()` with `$train()` on the complete
+dataset.^[**Key Point**: Nested resampling is not for selecting the “final”
+best hyperparameter configuration. Instead, it’s used to get an unbiased
+estimate of model performance after tuning — taking into account the tuning
+process itself.]
+
+:::{.callout-note}
+# This is computationally intensive
+
+Jacob Fiksel has a [nice post](https://jfiksel.github.io/2022-01-04-missdat/)
+about how this can get very computationally expensive very quickly.
+
+It is recommended to use penalisation here, if possible. This is discussed in
+[Section
+10.1](https://mlr3book.mlr-org.com/chapters/chapter10/advanced_technical_aspects_of_mlr3.html#sec-parallelization)
+of the `{mlr3}` tutorial.
+
+:::
+
+## Nested resampling with `AutoTuner`
+
+Nested resampling is all altomated in `{mlr3tuning}` by passing `AutoTuner` to `resample()` or `benchmark()`.
+
+Let's continue with the previous example, using the auto-tuner to resample a SVC with three-fold CV in the outer resampling and four-fold CV in the inner resampling.
+The `tnr_grid_search` and `lrn_svm` objects were create in @sec-tuning-tune.
+
+```{r}
+at <- auto_tuner(
+                 tuner = tnr_grid_search,
+                 learner = lrn_svm,
+                 resampling = rsmp("cv", folds = 4),
+                 measure = msr_ce
+                 )
+
+rr <- resample(tsk_sonar, at, rsmp("cv", folds = 3), store_models = TRUE) #<1>
+rr
+```
+1. Setting `store_models = TRUE` allows us to see the `AutoTuner` models
+   (fitted on the outer training data), and also enables investigation of the inner tuning instances.
+
+The estimated performance of the tuned model is the aggregated performance of all outer resampling iterations.
+
+```{r}
+rr$aggregate()
+```
+
+The function `extract_inner_tuning_results()` and
+`extract_inner_tuning_archives()` return the optimal configurations (across all
+outer folds) and full tuning archives, respectively.
+There are $75$ rows for `extract_inner_tuning_archives()` as each of the
+3 outer folds triggers a full 25-point grid search. Therefore, $3 \times 25
+= 75$ tuning evaluations are recorded.
+
+```{r}
+extract_inner_tuning_results(rr)[,
+  .(iteration, cost, gamma, classif.ce)]
+
+extract_inner_tuning_archives(rr)[,
+  .(iteration, cost, gamma, classif.ce)]
+```
+
+In [Section
+4.3.2](https://mlr3book.mlr-org.com/chapters/chapter4/hyperparameter_optimization.html#sec-resample-overfitting),
+nested resampling is compared to a normal tuning technique, to show that the
+latter gives much more optimistically biased performance estimates.
+
+:::{.callout-important}
+# Summary of how to use HPO and nested resampling
+
+**Why use tuned hyperparameters on the full dataset?**
+
+After tuning (e.g., via `auto_tuner()` or `tune()`), you should train your final model using all available training data. This ensures:
+
+- The model benefits from the maximum amount of information.
+- You're using the best hyperparameters found during tuning.
+- This final model is the one you'd use for deployment or making future predictions.
+
+**Why report performance from nested resampling?**
+
+Nested resampling gives an unbiased estimate of generalisation error because:
+
+- The tuning is performed inside the training folds (inner resampling).
+- Evaluation is done on outer test folds that were never used for tuning.
+- This corrects for optimism — the bias introduced when performance is evaluated on data also used for tuning.
+
+**Summary:**
+
+<div style="text-align: center;">
+  <div style="border: 1px solid #ccc; padding: 0.5em; display: inline-block; text-align: left;">
+
+  | Step                            | Purpose                                          |
+  |---------------------------------|--------------------------------------------------|
+  | Train tuned model on full data  | For final model and deployment                   |
+  | Report nested CV performance    | For honest estimate of generalisation error      |
+
+  </div>
+</div>
+
+:::
+
 # More Advanced Search Spaces {#sec-advanced-search-space}
+
+In this section, we look at the following:
+
+- Using `to_tune()` to tune different scalar parameter classes;
+- Using `ParamSet` to define your own search space (e.g. to handle tuning over vectors, transformations or handling parameter dependencies);
+- Accessing a database of standardised search spaces from the literature.
+
+## Scalar parameter tuning
+
+The `to_tune()` function can be used to tune parameters of any class.
+
+```{r}
+learner = lrn("classif.svm",
+  cost  = to_tune(1e-1, 1e5),
+  kernel = to_tune(c("radial", "linear")), #<1>
+  shrinking = to_tune(), #<2>
+  type = "C-classification"
+)
+
+learner$param_set$search_space()
+```
+1. A factor, so pass the vector of levels required.
+2. A logical, which `to_tune()` recognises automatically.
+
+Numerical parameters can also be treated as factors if we want to discretise them over a small subset of possible values. For example;
+```r
+lrn("classif.ranger", num.trees = to_tune(c(100, 200, 400)))
+```
+
+## Defining Search Spaces with `ps`
+
+The helper function `to_tune()` creates a parameter set that is then used by `tune()`, `ti()` or `auto_tuner()`.
+However, sometimes you will need to create a parameter set manually using `ps()`.
+This function takes names arguments of class `Domain`, which can be create using the sugar functions in the table below.
+
+| Constructor | Description                            | Underlying Class |
+|-------------|----------------------------------------|------------------|
+| `p_dbl`     | Real valued parameter (“double”)       | `ParamDbl`       |
+| `p_int`     | Integer parameter                      | `ParamInt`       |
+| `p_fct`     | Discrete valued parameter (“factor”)   | `ParamFct`       |
+| `p_lgl`     | Logical / Boolean parameter            | `ParamLgl`       |
+| `p_uty`     | Untyped parameter                      | `ParamUty`       |
+:`Domain` Constructors and their resulting `Domain`. 
+
+A simple example: create a search space to tune `cost` `kernel` and `shrinking`,
+
+```{r}
+search_space = ps(
+                  cost = p_dbl(lower = 1e-1, upper = 1e5),
+                  kernel = p_fct(c("radial", "linear")),
+                  shrinking = p_lgl()
+                  )
+```
+We then pass this search space into `ti()`.
+
+```{r}
+ti(
+   tsk_sonar, 
+   lrn("classif.svm", type = "C-classification"),
+   rsmp("cv", folds = 3),
+   msr_ce,
+   trm("none"),
+   search_space = search_space
+   )
+```
+
+For creating more advanced search spaces, see [Section 4.4.3](https://mlr3book.mlr-org.com/chapters/chapter4/hyperparameter_optimization.html#sec-tune-trafo) (*Transformations and Tuning Over Vectors*).^[This section considers different transformations of parameters, and scenarios where hyperparameters are interdependent or need to be transformed jointly. For instance, when tuning a support vector machine (SVM), the cost and gamma parameters often require simultaneous optimization due to their combined effect on model performance.]
+
+# Conclusion
+
+| Class                                                 | Constructor/Function               | Fields/Methods                          |
+|--------------------------------------------------------|------------------------------------|------------------------------------------|
+| `Terminator`                                           | `trm()`                            | –                                        |
+| `TuningInstanceBatchSingleCrit` or `TuningInstanceBatchMultiCrit` | `ti()` / `tune()`             | `$result`; `$archive`                   |
+| `TunerBatch`                                           | `tnr()`                            | `$optimize()`                           |
+| `TuneToken`                                            | `to_tune()`                        | –                                        |
+| `AutoTuner`                                            | `auto_tuner()`                     | `$train()`; `$predict()`; `$tuning_instance` |
+| –                                                      | `extract_inner_tuning_results()`  | –                                        |
+| –                                                      | `extract_inner_tuning_archives()` | –                                        |
+| `ParamSet`                                             | `ps()`                             | –                                        |
+| `TuningSpace`                                          | `lts()`                            | `$values`                                |
+:Important classes and functions covered in this chapter with underlying class (if applicable), class constructor or function, and important class fields and methods (if applicable).
